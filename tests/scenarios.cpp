@@ -13,6 +13,9 @@
 #include <PropGuard/Core/PG_Clock.mqh>
 #include <PropGuard/Core/PG_RiskCalc.mqh>
 #include <PropGuard/Core/PG_RuleEngine.mqh>
+#include <PropGuard/Core/PG_Hash.mqh>
+#include <PropGuard/Core/PG_Log.mqh>
+#include <PropGuard/Core/PG_Lock.mqh>
 #include <PropGuard/Firms/PG_Firms.mqh>
 
 #include <cstdio>
@@ -976,6 +979,268 @@ static void TestValidation()
   }
 
 //==================================================================
+// GROUP: WINDOW - the weekly lock and its escape hatch
+//==================================================================
+static void TestLockWindow()
+  {
+   std::printf("\n\033[1mWINDOW - the weekly lock, and getting around it\033[0m\n");
+
+   PG_RuleSet rules = FirmStandard();
+   rules.week_reset_dow = 0; rules.week_reset_hour = 22;
+   const long monday = PG_MakeTime(2026,8,3,12,0,0);
+
+   //--- a locked state at 3.5% daily
+   PG_LockState st;
+   st.account_login = 12345678;
+   st.firm_id="test"; st.program_id="std"; st.phase_label="Phase 1";
+     {
+      PG_UserConfig c; c.Defaults();
+      c.use_overrides=true; c.daily_limit_pct=3.5; c.maxdd_limit_pct=7.0;
+      PG_ApplyConfig(st,c,monday,rules);
+     }
+
+   CHECK("WINDOW","99 lock is active after applying",PG_LockIsActive(st,monday));
+
+   //--- 100. tightening is always allowed
+     {
+      PG_UserConfig tighter = st.current; tighter.daily_limit_pct=2.0;
+      string why;
+      CHECK("WINDOW","100 tightening allowed inside the window",
+            PG_CanApplyConfig(st,tighter,monday,why));
+     }
+
+   //--- 101. loosening is refused, with an explanation
+     {
+      PG_UserConfig looser = st.current; looser.daily_limit_pct=4.5;
+      string why;
+      const bool ok = PG_CanApplyConfig(st,looser,monday,why);
+      CHECK("WINDOW","101 loosening refused inside the window",!ok);
+      CHECK("WINDOW","102 refusal names the field",
+            StringFind(why,"daily loss limit")>=0);
+     }
+
+   //--- 103. typing a zero must not read as "no limit, therefore fine"
+     {
+      PG_UserConfig zeroed = st.current; zeroed.daily_limit_pct=0.0;
+      string why;
+      CHECK("WINDOW","103 zeroing a limit is treated as loosening",
+            !PG_CanApplyConfig(st,zeroed,monday,why));
+     }
+
+   //--- 104. switching to monitor mode is loosening too
+     {
+      PG_UserConfig watch = st.current; watch.enforce_mode=PG_ENFORCE_MONITOR;
+      string why;
+      CHECK("WINDOW","104 dropping to monitor mode is refused",
+            !PG_CanApplyConfig(st,watch,monday,why));
+     }
+
+   //--- 105/106. the 24 hour unlock, and impatience not shortening it
+     {
+      PG_LockState s2 = st;
+      PG_RequestUnlock(s2,monday);
+      check_eq_i("WINDOW","105 unlock lands 24h later",
+                 PG_UnlockEffectiveAt(s2)-monday,PG_UNLOCK_DELAY_SECONDS);
+      PG_RequestUnlock(s2,monday+3600);
+      check_eq_i("WINDOW","106 asking again does not restart the clock",
+                 PG_UnlockEffectiveAt(s2)-monday,PG_UNLOCK_DELAY_SECONDS);
+
+      PG_UserConfig looser = s2.current; looser.daily_limit_pct=4.5;
+      string why;
+      CHECK("WINDOW","107 still refused before the delay elapses",
+            !PG_CanApplyConfig(s2,looser,monday+3600,why));
+      CHECK("WINDOW","108 allowed once the delay has elapsed",
+            PG_CanApplyConfig(s2,looser,monday+PG_UNLOCK_DELAY_SECONDS+60,why));
+     }
+
+   //--- 109. once the week is served the settings open up again. This is a
+   //---      weekly commitment, not a permanent ratchet.
+     {
+      PG_LockState s3 = st;
+      const long after_window = s3.locked_until+3600;
+      PG_UserConfig looser = s3.current; looser.daily_limit_pct=4.5;
+      string why;
+      CHECK("WINDOW","109 loosening allowed once the window closes",
+            PG_CanApplyConfig(s3,looser,after_window,why));
+     }
+
+   //--- 110/111. tightening twice keeps the tighter of the two forever
+     {
+      PG_LockState s4 = st;
+      PG_UserConfig t1 = s4.current; t1.daily_limit_pct=2.0;
+      PG_ApplyConfig(s4,t1,monday+60,rules);
+      check_eq("WINDOW","110 floor records the tighter value",
+               s4.strictest.daily_limit_pct,2.0);
+
+      PG_UserConfig back = s4.current; back.daily_limit_pct=3.0;
+      string why;
+      CHECK("WINDOW","111 cannot walk a tightening back",
+            !PG_CanApplyConfig(s4,back,monday+120,why));
+     }
+
+   //--- 112/113. rebinding
+     {
+      PG_LockState s5 = st;
+      PG_Rebind(s5,12345678,"test","std","Phase 2",monday);
+      CHECK("WINDOW","112 same account keeps the floor",s5.has_strictest);
+
+      PG_LockState s6 = st;
+      PG_Rebind(s6,99999999,"test","std","Phase 1",monday);
+      CHECK("WINDOW","113 a different account clears the floor",!s6.has_strictest);
+     }
+
+   //--- 114. binding change detection
+     {
+      CHECK("WINDOW","114 binding change detected",
+            PG_BindingChanged(st,12345678,"other","std","Phase 1"));
+      CHECK("WINDOW","115 identical binding is not a change",
+            !PG_BindingChanged(st,12345678,"test","std","Phase 1"));
+     }
+
+   //--- 116/117. signature
+     {
+      PG_LockState s7 = st;
+      PG_SignLockState(s7,"propguard-key");
+      CHECK("WINDOW","116 signature verifies",
+            PG_VerifyLockState(s7,"propguard-key"));
+      s7.current.daily_limit_pct = 9.0;      // hand-edited state file
+      CHECK("WINDOW","117 tampering breaks the signature",
+            !PG_VerifyLockState(s7,"propguard-key"));
+     }
+
+   //--- 118/119. the payoff: a broken state file falls back to the
+   //---           strictest known configuration, never to defaults
+     {
+      PG_LockState s8 = st;                  // strictest = 3.5 daily
+      PG_FallbackToStrictest(s8,12345678,monday,rules,true);
+      check_eq("WINDOW","118 fallback restores the strictest value",
+               s8.current.daily_limit_pct,3.5);
+      CHECK("WINDOW","119 fallback closes the lock window",
+            PG_LockIsActive(s8,monday));
+     }
+
+   //--- 120. with nothing recoverable it still locks rather than opening up
+     {
+      PG_LockState s9;
+      PG_FallbackToStrictest(s9,12345678,monday,rules,false);
+      CHECK("WINDOW","120 empty history still starts locked",
+            PG_LockIsActive(s9,monday));
+     }
+
+   //--- 121. the counter only ever goes up, so a restored backup is visible
+     {
+      PG_LockState s10 = st;
+      const long before = s10.counter;
+      PG_UserConfig t = s10.current; t.daily_limit_pct=1.0;
+      PG_ApplyConfig(s10,t,monday+60,rules);
+      CHECK("WINDOW","121 counter is monotonic",s10.counter>before);
+     }
+  }
+
+//==================================================================
+// GROUP: LOG - the audit chain
+//==================================================================
+static void TestLogChain()
+  {
+   std::printf("\n\033[1mLOG - append-only, tamper-evident decision records\033[0m\n");
+
+   PG_LogRecord r;
+   r.ts = PG_MakeTime(2026,8,5,14,30,15);
+   r.seq = 1;
+   r.severity = PG_SEV_CRITICAL;
+   r.event = "enforce";
+   r.rule = PG_RULE_WORST_CASE;
+   r.action = PG_ACT_REDUCE;
+   r.ticket = 1000;
+   r.current = 5820.0;
+   r.limit_user = 3500.0;
+   r.limit_firm = 5000.0;
+   r.account = 12345678;
+   r.firm_id = "fundednext";
+   r.program_id = "stellar-2step";
+   r.phase = "Phase 1";
+   r.rules_verified = false;
+   r.mode = PG_ENFORCE_REDUCE;
+   r.tier = PG_TIER_ENFORCE;
+   r.balance = 100000.0;
+   r.equity = 99400.0;
+   r.reason = "If every stop is hit, equity lands at 94180.00, below the daily floor 96500.00.";
+
+   ulong h1=0, h2=0, h3=0;
+   const string l1 = PG_FormatLogLine(r,0,h1);
+
+   //--- 122. a line verifies against the chain position it was written at
+     {
+      ulong got=0;
+      CHECK("LOG","122 line verifies",PG_VerifyLogLine(l1,0,got));
+     }
+
+   //--- 123. and fails against a different one
+     {
+      ulong got=0;
+      CHECK("LOG","123 wrong chain position is rejected",
+            !PG_VerifyLogLine(l1,12345,got));
+     }
+
+   //--- 124. consecutive lines chain
+     {
+      r.seq=2; r.reason="Closed position #1000.";
+      const string l2 = PG_FormatLogLine(r,h1,h2);
+      ulong got=0;
+      CHECK("LOG","124 second line chains to the first",
+            PG_VerifyLogLine(l2,h1,got));
+      r.seq=3;
+      const string l3 = PG_FormatLogLine(r,h2,h3);
+      CHECK("LOG","125 third line chains to the second",
+            PG_VerifyLogLine(l3,h2,got));
+      CHECK("LOG","126 digests differ between lines",h1!=h2 && h2!=h3);
+     }
+
+   //--- 127. an edited reason breaks its own digest
+     {
+      string edited = l1;
+      CHECK("LOG","127 reason is present to edit",
+            StringReplace(edited,"94180.00","99180.00"));
+      ulong got=0;
+      CHECK("LOG","128 edited line fails verification",
+            !PG_VerifyLogLine(edited,0,got));
+     }
+
+   //--- 129. the record carries both limits, which is the whole point
+     {
+      CHECK("LOG","129 line records the trader limit",
+            StringFind(l1,"\"limit_user\":3500.00")>=0);
+      CHECK("LOG","130 line records the firm limit",
+            StringFind(l1,"\"limit_firm\":5000.00")>=0);
+      CHECK("LOG","131 unverified rules are stamped on every line",
+            StringFind(l1,"\"rules_verified\":false")>=0);
+     }
+
+   //--- 132. quotes and newlines in a reason cannot break the format
+     {
+      PG_LogRecord q;
+      q.ts = r.ts;
+      q.reason = "symbol \"EUR/USD\"\nline two\ttabbed";
+      ulong h=0;
+      const string line = PG_FormatLogLine(q,0,h);
+      ulong got=0;
+      CHECK("LOG","132 escaped payload still verifies",
+            PG_VerifyLogLine(line,0,got));
+      CHECK("LOG","133 raw newline never reaches the file",
+            StringFind(line,"\n")<0);
+     }
+
+   //--- 134. the panel rendering is short and human
+     {
+      const string p = PG_FormatPanelLine(r);
+      CHECK("LOG","134 panel line starts with the time",
+            StringFind(p,"14:30:15")==0);
+      CHECK("LOG","135 panel line names the rule",
+            StringFind(p,"WORST_CASE")>0);
+     }
+  }
+
+//==================================================================
 int main()
   {
    std::printf("\n\033[1m================ PropGuard scenario suite ================\033[0m\n");
@@ -989,6 +1254,8 @@ int main()
    TestPreTradeGate();
    TestTightenOnly();
    TestValidation();
+   TestLockWindow();
+   TestLogChain();
 
    std::printf("\n\033[1m==========================================================\033[0m\n");
    std::printf("  total %d   \033[32mpassed %d\033[0m   \033[31mfailed %d\033[0m\n",

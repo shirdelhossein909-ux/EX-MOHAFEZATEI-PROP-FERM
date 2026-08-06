@@ -85,6 +85,14 @@ inline string StringSubstr(const string &s,int start,int count=-1)
    return s.substr((size_t)start,(size_t)count);
   }
 
+//--- MQL5 returns the code unit at an index; our hashed payloads are ASCII
+inline ushort StringGetCharacter(const string &s,int index)
+  {
+   if(index<0 || index>=(int)s.size())
+      return 0;
+   return (ushort)(unsigned char)s[(size_t)index];
+  }
+
 inline int StringFind(const string &s,const string &sub,int start=0)
   {
    if(start<0)
